@@ -3,6 +3,7 @@ import os
 import re
 import requests
 import unicodedata
+import webbrowser
 from difflib import SequenceMatcher
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -13,11 +14,25 @@ from PyQt5.QtWidgets import (
     QScrollArea, QFrame
 )
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QBrush
-from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QTimer
+from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QTimer, QUrl
 from googleapiclient.discovery import build
 import yt_dlp
-from config import API_KEY
 from collections import defaultdict
+
+# La API key se lee de la variable de entorno YOUTUBE_API_KEY o, si no existe,
+# del archivo local config.py (ignorado por git; ver config.example.py).
+API_KEY = os.environ.get('YOUTUBE_API_KEY')
+if not API_KEY:
+    try:
+        from config import API_KEY
+    except ImportError:
+        API_KEY = None
+if not API_KEY:
+    sys.exit(
+        "Falta la API key de YouTube.\n"
+        "Copia config.example.py como config.py y pon tu clave, "
+        "o define la variable de entorno YOUTUBE_API_KEY."
+    )
 
 YOUTUBE_API = build('youtube', 'v3', developerKey=API_KEY)
 
@@ -961,11 +976,33 @@ class DownloadThread(QThread):
                 }],
                 'ffmpeg_location': r'C:\ProgramData\chocolatey\lib\ffmpeg-full\tools\ffmpeg\bin',
                 'progress_hooks': [self.progress_hook],
-                'quiet': True
+                'quiet': True,
+                'no_color': True,
+                'cookiesfrombrowser': ('firefox',),
+                'retries': 5,
+                'fragment_retries': 5
             }
-            
-            with yt_dlp.YoutubeDL(options) as ydl:
-                ydl.download([self.video_url])
+
+            # Los enlaces directos de YouTube son temporales y ocasionalmente
+            # un servidor CDN los rechaza con 403. Una nueva instancia fuerza
+            # una extracción fresca y obtiene una URL de descarga diferente.
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    with yt_dlp.YoutubeDL(options) as ydl:
+                        ydl.download([self.video_url])
+                    break
+                except Exception as error:
+                    is_forbidden = 'HTTP Error 403' in str(error)
+                    if not is_forbidden or attempt == max_attempts - 1:
+                        raise
+
+                    self.progress_updated.emit({
+                        'status': 'retrying',
+                        'attempt': attempt + 2,
+                        'max_attempts': max_attempts
+                    })
+                    QThread.msleep(1500 * (attempt + 1))
             
             self.download_finished.emit("Descarga completada exitosamente")
         except Exception as e:
@@ -1039,6 +1076,7 @@ class YouTubeDownloader(QWidget):
         self.thumbnail_loaders = []
         self.search_results = []
         self.next_song_number = 1
+        self.current_video_id = None
         
         self.init_ui()
 
@@ -1219,6 +1257,20 @@ class YouTubeDownloader(QWidget):
         progress_layout.addWidget(self.progress_bar)
         
         main_layout.addLayout(progress_layout)
+
+        # Panel de previsualización - abre en navegador
+        preview_layout = QHBoxLayout()
+        
+        self.preview_button = QPushButton("🎧 Escuchar en YouTube")
+        self.preview_button.clicked.connect(self.preview_selected)
+        self.preview_button.setToolTip("Abre la canción seleccionada en tu navegador para escucharla")
+        preview_layout.addWidget(self.preview_button)
+        
+        self.preview_title_label = QLabel("💡 Selecciona una canción y haz clic para escucharla en YouTube")
+        self.preview_title_label.setStyleSheet("color: #aaa; font-style: italic;")
+        preview_layout.addWidget(self.preview_title_label, 1)
+        
+        main_layout.addLayout(preview_layout)
 
         # Botones inferiores
         button_layout = QHBoxLayout()
@@ -1499,6 +1551,12 @@ class YouTubeDownloader(QWidget):
         elif d['status'] == 'finished':
             self.progress_bar.setValue(100)
             self.progress_label.setText("Procesando audio...")
+        elif d['status'] == 'retrying':
+            self.progress_bar.setValue(0)
+            self.progress_label.setText(
+                f"Enlace rechazado por YouTube. Reintentando "
+                f"({d['attempt']}/{d['max_attempts']})..."
+            )
 
     def on_download_finished(self, message):
         self.download_button.setEnabled(True)
@@ -1516,6 +1574,41 @@ class YouTubeDownloader(QWidget):
         self.progress_label.setText("❌ Error en la descarga")
         self.progress_bar.setValue(0)
         QMessageBox.critical(self, "Error", f"No se pudo descargar: {error}")
+
+    # =========================================================================
+    # MÉTODOS DE PREVISUALIZACIÓN DE AUDIO
+    # =========================================================================
+    
+    def preview_selected(self):
+        """Abrir el video seleccionado en el navegador para escucharlo"""
+        # Determinar qué lista está activa
+        current_tab = self.tabs.currentIndex()
+        if current_tab == 0:
+            item = self.song_results_list.currentItem()
+        elif current_tab == 1:
+            item = self.artist_results_list.currentItem()
+        else:
+            QMessageBox.warning(self, "Advertencia", "Selecciona un video de las pestañas de búsqueda.")
+            return
+        
+        if not item:
+            QMessageBox.warning(self, "Advertencia", "Selecciona un video para escuchar.")
+            return
+        
+        video_data = item.data(Qt.UserRole)
+        if not video_data:
+            return
+        
+        # Abrir en el navegador predeterminado
+        url = video_data['url']
+        title = video_data['title']
+        
+        # Actualizar etiqueta
+        self.preview_title_label.setText(f"🎵 Reproduciendo: {title[:50]}...")
+        self.preview_title_label.setStyleSheet("color: #3a8ee6;")
+        
+        # Abrir en navegador
+        webbrowser.open(url)
 
     def scan_library(self):
         """Escanear carpeta de música y mostrar estadísticas"""
@@ -1801,7 +1894,7 @@ class YouTubeDownloader(QWidget):
         QMessageBox.information(self, "Desorganización completada", message)
 
     def renumber_songs(self):
-        """Renumerar canciones en una carpeta, agrupando por artista"""
+        """Renumerar canciones en una carpeta, agrupando por artista con formato 'Artista - 001 - Canción'"""
         path = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta a renumerar", self.save_path)
         if not path:
             return
@@ -1821,6 +1914,7 @@ class YouTubeDownloader(QWidget):
         
         for file in music_files:
             # Quitar numeración existente para detectar artista
+            # Puede estar al inicio "001 - ..." o después del artista "Artista - 001 - ..."
             clean_name = re.sub(r'^\d+\s*[-_.]?\s*', '', file)
             
             # Extraer artista del nombre del archivo
@@ -1850,31 +1944,72 @@ class YouTubeDownloader(QWidget):
         # Ordenar artistas alfabéticamente y renumerar cada grupo
         for canonical_artist in sorted(grouped_artists.keys()):
             songs = grouped_artists[canonical_artist]
+            safe_artist = self.sanitize_filename(canonical_artist)
             
-            # Ordenar canciones de este artista alfabéticamente
-            songs_sorted = sorted(songs, key=lambda x: x['name'].lower())
+            # Ordenar canciones de este artista alfabéticamente (por nombre de canción, no por archivo completo)
+            def get_song_name(song):
+                name = song['name']
+                # Quitar numeración al inicio
+                name = re.sub(r'^\d+\s*[-_.]?\s*', '', name)
+                # Quitar artista al inicio si está
+                if " - " in name:
+                    parts = name.split(" - ")
+                    # Si la primera parte es el artista, usar el resto
+                    if normalize_artist_name(parts[0]) == normalize_artist_name(canonical_artist):
+                        name = " - ".join(parts[1:])
+                    # También quitar numeración del medio: "Artista - 001 - Canción"
+                    elif len(parts) > 1 and re.match(r'^\d+$', parts[1].strip()):
+                        name = " - ".join(parts[2:]) if len(parts) > 2 else parts[0]
+                return name.lower()
+            
+            songs_sorted = sorted(songs, key=get_song_name)
             
             # Renumerar canciones de este artista
             for i, song in enumerate(songs_sorted, start=1):
                 src = song['path']
                 original_name = song['name']
+                ext = os.path.splitext(original_name)[1]
                 
                 if not os.path.exists(src):
                     continue
                 
-                # Quitar numeración existente
-                clean_name = re.sub(r'^\d+\s*[-_.]?\s*', '', original_name)
+                # Extraer solo el nombre de la canción (sin artista ni numeración)
+                name_without_ext = os.path.splitext(original_name)[0]
                 
-                # Nuevo nombre con numeración
-                new_name = f"{i:03d} - {clean_name}"
+                # Quitar numeración al inicio
+                clean_name = re.sub(r'^\d+\s*[-_.]?\s*', '', name_without_ext)
+                
+                # Quitar el artista del nombre si está al inicio
+                if " - " in clean_name:
+                    parts = clean_name.split(" - ")
+                    artist_normalized = normalize_artist_name(canonical_artist)
+                    
+                    # Caso: "Artista - Canción" o "Artista - 001 - Canción"
+                    if normalize_artist_name(parts[0]) == artist_normalized:
+                        remaining_parts = parts[1:]
+                        # Si el siguiente es un número, quitarlo también
+                        if remaining_parts and re.match(r'^\d+$', remaining_parts[0].strip()):
+                            remaining_parts = remaining_parts[1:]
+                        song_title = " - ".join(remaining_parts) if remaining_parts else parts[0]
+                    else:
+                        song_title = clean_name
+                else:
+                    song_title = clean_name
+                
+                # Limpiar el título de la canción
+                song_title = song_title.strip()
+                if not song_title:
+                    song_title = name_without_ext
+                
+                # Nuevo formato: "Artista - 001 - Canción.ext"
+                new_name = f"{safe_artist} - {i:03d} - {song_title}{ext}"
                 dst = os.path.join(path, new_name)
                 
                 # Si ya existe un archivo con ese nombre (y no es el mismo), agregar sufijo
                 if os.path.exists(dst) and src != dst:
-                    base, ext = os.path.splitext(new_name)
                     counter = 1
                     while os.path.exists(dst):
-                        new_name = f"{base} ({counter}){ext}"
+                        new_name = f"{safe_artist} - {i:03d} - {song_title} ({counter}){ext}"
                         dst = os.path.join(path, new_name)
                         counter += 1
                 
@@ -1889,7 +2024,8 @@ class YouTubeDownloader(QWidget):
         artist_count = len(grouped_artists)
         message = f"✅ Se renumeraron {renamed_count} canciones."
         message += f"\n\n📊 {artist_count} artistas detectados."
-        message += f"\n\n💡 Cada artista tiene su propia numeración empezando en 001."
+        message += f"\n\n💡 Formato: 'Artista - 001 - Canción'"
+        message += f"\n\nAl ordenar alfabéticamente, las canciones quedarán agrupadas por artista."
         
         QMessageBox.information(self, "Renumeración completada", message)
 
