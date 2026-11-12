@@ -1,0 +1,4 @@
+PyQt5
+google-api-python-client
+yt-dlp
+requests

@@ -1,1 +1,16 @@
+# Secretos
 config.py
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Audio descargado
+*.mp3
+*.m4a
+*.wav
+*.flac
+*.ogg
